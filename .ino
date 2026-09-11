@@ -1,246 +1,471 @@
-/ =========================
-// 핀 설정
-// =========================
-const int QUAD_PIN       = A0;  // 대퇴사두근 EMG 센서
-const int HAM_PIN        = A1;  // 햄스트링 EMG 센서
-const int ANGLE_PIN      = A2;  // 무릎 각도 센서 (가변저항 등)
+#include <ESP32Servo.h>
+#include <math.h>
 
-const int MOTOR_DIR_PIN  = 4;   // 모터 방향 제어 핀
-const int MOTOR_PWM_PIN  = 5;   // 모터 속도 제어 핀 (PWM)
+// =====================================================
+// 1. 핀 설정
+// =====================================================
 
-// =========================
-// 설정값 (상수)
-// =========================
+// EMG 센서
+const int QUAD_PIN = 34;       // 대퇴사두근 EMG
+const int HAM_PIN  = 35;       // 햄스트링 EMG
+
+// Flex 센서
+const int FLEX_PIN = 32;
+
+// 서보모터
+const int SERVO_PIN = 25;
+
+
+// =====================================================
+// 2. 설정값
+// =====================================================
+
 const int RMS_WINDOW = 50;
+
+// EMG 두 근육의 차이가 이 비율 이상일 때 방향 결정
 const float DEAD_BAND = 1.20;
 
-const float MAX_KNEE_ANGLE = 170.0; // 최대 신전 제한 각도
-const float MIN_KNEE_ANGLE = 40.0;  // 최소 굴곡 제한 각도
+// 모델 다리의 각도 제한
+const float MIN_KNEE_ANGLE = 40.0;
+const float MAX_KNEE_ANGLE = 170.0;
 
-const int MOTOR_SPEED = 150;        // 모터 구동 속도 (0 ~ 255)
 
-// =========================
-// 전역 변수
-// =========================
+// =====================================================
+// 3. Flex 센서 보정값
+// =====================================================
+
+// 실제 Flex 센서의 측정값에 맞게 수정해야 함
+//
+// FLEX_STRAIGHT_RAW
+// → 다리가 펴졌을 때의 ADC 값
+//
+// FLEX_BENT_RAW
+// → 다리가 구부러졌을 때의 ADC 값
+
+const int FLEX_STRAIGHT_RAW = 1800;
+const int FLEX_BENT_RAW     = 3000;
+
+
+// =====================================================
+// 4. 서보 설정
+// =====================================================
+
+Servo kneeServo;
+
+// 서보가 움직일 실제 범위
+const int SERVO_MIN = 0;
+const int SERVO_MAX = 180;
+
+
+// =====================================================
+// 5. 전역 변수
+// =====================================================
+
 float activationThreshold = 0.0;
 
 float quadRMS = 0.0;
 float hamRMS = 0.0;
+
 float kneeAngle = 90.0;
 
 String intent = "IDLE";
 
-// =========================
-// RMS 계산 (EMG 신호 처리)
-// =========================
+
+// =====================================================
+// 6. EMG RMS 계산
+// =====================================================
+
 float calculateRMS(int pin)
 {
-    long sumSquares = 0;
+    double sumSquares = 0;
 
-    for(int i = 0; i < RMS_WINDOW; i++)
+    for (int i = 0; i < RMS_WINDOW; i++)
     {
         int value = analogRead(pin);
-        
-        // 하드웨어 신호의 DC 오프셋 제거 (중앙값 512 기준)
-        // 사용하는 EMG 모듈에 따라 이 값을 조절해야 할 수 있습니다.
-        value -= 512; 
 
-        sumSquares += (long)value * value;
-        delayMicroseconds(500); // 2kHz 샘플링 속도 유지
+        /*
+         * ESP32 ADC는 기본적으로 0~4095 범위.
+         *
+         * EMG 센터값이 약 2048이라고 가정.
+         * 실제 센서에 따라 조정 필요.
+         */
+        value -= 2048;
+
+        sumSquares += (double)value * value;
+
+        delayMicroseconds(500);
     }
 
-    return sqrt((float)sumSquares / RMS_WINDOW);
+    return sqrt(sumSquares / RMS_WINDOW);
 }
 
-// =========================
-// EMG 초기 캘리브레이션
-// =========================
+
+// =====================================================
+// 7. EMG 캘리브레이션
+// =====================================================
+
 void calibrateEMG()
 {
     bool calibrated = false;
 
-    while(!calibrated)
+    while (!calibrated)
     {
-        Serial.println("\n[Calibration] 다리에 힘을 빼고 편안히 계세요.");
-        Serial.println("[Calibration] 5초간 기저 노이즈를 측정합니다...");
+        Serial.println();
+        Serial.println("================================");
+        Serial.println("EMG CALIBRATION");
+        Serial.println("다리에 힘을 빼고 편안하게 유지하세요.");
+        Serial.println("5초 동안 측정합니다.");
+        Serial.println("================================");
 
-        float rmsSum = 0;
-        float rmsMax = 0;
+        delay(1000);
+
+        float rmsSum = 0.0;
+        float rmsMax = 0.0;
+
         int sampleCount = 0;
 
         unsigned long startTime = millis();
 
-        while(millis() - startTime < 5000)
+        while (millis() - startTime < 5000)
         {
             float quad = calculateRMS(QUAD_PIN);
-            float ham = calculateRMS(HAM_PIN);
+            float ham  = calculateRMS(HAM_PIN);
+
             float strongest = max(quad, ham);
 
             rmsSum += strongest;
-            if(strongest > rmsMax) {
+
+            if (strongest > rmsMax)
+            {
                 rmsMax = strongest;
             }
+
             sampleCount++;
+
             delay(10);
         }
 
         float rmsAvg = rmsSum / sampleCount;
 
-        // 캘리브레이션 기간 동안 움직임(노이즈)이 너무 심했는지 체크
-        if((rmsMax - rmsAvg) > 10.0)
-            Serial.println("[Error] 활동이 감지되었습니다. 다시 시작합니다.");
+        Serial.println();
+        Serial.print("평균 RMS: ");
+        Serial.println(rmsAvg);
+
+        Serial.print("최대 RMS: ");
+        Serial.println(rmsMax);
+
+        /*
+         * 캘리브레이션 중 신호 변화가 지나치게 큰 경우
+         * 다시 측정
+         */
+        if ((rmsMax - rmsAvg) > 10.0)
+        {
+            Serial.println("움직임 또는 큰 신호 변화가 감지되었습니다.");
+            Serial.println("캘리브레이션을 다시 시작합니다.");
+
             delay(2000);
         }
         else
         {
-            // 여유값(안전 마진)을 1.5배 정도 더해주면 오작동을 줄일 수 있습니다.
-            activationThreshold = rmsMax * 1.2; 
+            /*
+             * 기준값보다 약간 높은 값을
+             * 실제 활성화 기준으로 사용
+             */
+            activationThreshold = rmsMax * 1.2;
+
             calibrated = true;
 
-            Serial.print("[Success] 설정된 문턱값(Threshold): ");
+            Serial.println();
+            Serial.println("캘리브레이션 완료!");
+
+            Serial.print("Activation Threshold: ");
             Serial.println(activationThreshold);
+
+            delay(1000);
         }
     }
 }
 
-// =========================
-// 무릎 각도 읽기
-// =========================
+
+// =====================================================
+// 8. Flex 센서 → 무릎 각도 변환
+// =====================================================
+
 float getKneeAngle()
 {
-    int rawValue = analogRead(ANGLE_PIN);
-    
-    // analogRead 값(0~1023)을 실제 무릎 각도(예: 0~180도)로 매핑
-    // 실제 센서의 장착 방향과 회전 범위에 맞게 아래의 0, 1023, 0, 180 수치를 수정해야 합니다.
-    float angle = map(rawValue, 0, 1023, 0, 180); 
-    
+    int rawValue = analogRead(FLEX_PIN);
+
+    /*
+     * Flex 센서의 ADC 값을
+     * 40~170도의 무릎 각도로 변환
+     */
+    float angle = map(
+        rawValue,
+        FLEX_STRAIGHT_RAW,
+        FLEX_BENT_RAW,
+        MAX_KNEE_ANGLE,
+        MIN_KNEE_ANGLE
+    );
+
+    // 각도 범위를 40~170도로 제한
+    angle = constrain(
+        angle,
+        MIN_KNEE_ANGLE,
+        MAX_KNEE_ANGLE
+    );
+
     return angle;
 }
 
-// =========================
-// 의도 판별
-// =========================
+
+// =====================================================
+// 9. 움직임 의도 판단
+// =====================================================
+
 void detectIntent()
 {
     quadRMS = calculateRMS(QUAD_PIN);
-    hamRMS = calculateRMS(HAM_PIN);
+    hamRMS  = calculateRMS(HAM_PIN);
 
     float strongest = max(quadRMS, hamRMS);
+
+    // 기본 상태
     intent = "IDLE";
 
-    // 문턱값을 넘는 근수축이 발생했을 때만 판별
-    if(strongest > activationThreshold)
+
+    // 기준값보다 신호가 강할 때만 판단
+    if (strongest > activationThreshold)
     {
-        // 대퇴사두근이 햄스트링보다 20% 이상 강할 때 (신전)
-        if(quadRMS > hamRMS * DEAD_BAND)
+        // 대퇴사두근이 20% 이상 강함
+        if (quadRMS > hamRMS * DEAD_BAND)
         {
             intent = "EXTEND";
         }
-        // 햄스트링이 대퇴사두근보다 20% 이상 강할 때 (굴곡)
-        else if(hamRMS > quadRMS * DEAD_BAND)
+
+        // 햄스트링이 20% 이상 강함
+        else if (hamRMS > quadRMS * DEAD_BAND)
         {
             intent = "FLEX";
         }
+
+        // 두 신호가 비슷함
+        else
+        {
+            intent = "IDLE";
+        }
     }
 }
 
-// =========================
-// 모터 구동 제어 함수
-// =========================
-void driveMotor(String direction, int speed)
+
+// =====================================================
+// 10. 서보 정지 위치
+// =====================================================
+
+void stopServo()
 {
-    if (direction == "EXTEND")
-    {
-        digitalWrite(MOTOR_DIR_PIN, HIGH); // 정방향 회전 설정 (하드웨어에 맞게 수정)
-        analogWrite(MOTOR_PWM_PIN, speed);
-    }
-    else if (direction == "FLEX")
-    {
-        digitalWrite(MOTOR_DIR_PIN, LOW);  // 역방향 회전 설정 (하드웨어에 맞게 수정)
-        analogWrite(MOTOR_PWM_PIN, speed);
-    }
-    else // IDLE 또는 STOP
-    {
-        analogWrite(MOTOR_PWM_PIN, 0);     // 모터 정지
-    }
+    /*
+     * 서보는 DC 모터처럼 즉시 "PWM 0"으로 정지시키는
+     * 방식이 아니다.
+     *
+     * 모델 테스트에서는 현재 각도를 유지하도록 한다.
+     */
 }
 
-// =========================
-// 상태 평가 및 동작 실행
-// =========================
-void evaluateState()
+
+// =====================================================
+// 11. 서보 제어
+// =====================================================
+
+void controlServo()
 {
-    if(intent == "EXTEND")
+    int targetAngle = (int)kneeAngle;
+
+
+    // -----------------------------------------------
+    // EXTEND
+    // -----------------------------------------------
+
+    if (intent == "EXTEND")
     {
-        // 소프트웨어 안전 리미트 확인 (최대 각도 미만일 때만 허용)
-        if(kneeAngle < MAX_KNEE_ANGLE)
+        /*
+         * 무릎 각도가 최대 제한에 도달하지 않은 경우
+         * 펴지는 방향으로 이동
+         */
+
+        if (kneeAngle < MAX_KNEE_ANGLE)
         {
-            Serial.println("STATUS: EXTEND ALLOWED");
-            driveMotor("EXTEND", MOTOR_SPEED);
+            targetAngle = (int)kneeAngle + 5;
+
+            targetAngle = constrain(
+                targetAngle,
+                (int)MIN_KNEE_ANGLE,
+                (int)MAX_KNEE_ANGLE
+            );
+
+            kneeServo.write(targetAngle);
+
+            Serial.println("SERVO: EXTEND");
         }
         else
         {
-            Serial.println("STATUS: EXTEND BLOCKED (MAX LIMIT)");
-            driveMotor("STOP", 0);
+            stopServo();
+
+            Serial.println("SERVO: EXTEND BLOCKED");
         }
     }
-    else if(intent == "FLEX")
+
+
+    // -----------------------------------------------
+    // FLEX
+    // -----------------------------------------------
+
+    else if (intent == "FLEX")
     {
-        // 소프트웨어 안전 리미트 확인 (최소 각도 초과일 때만 허용)
-        if(kneeAngle > MIN_KNEE_ANGLE)
+        /*
+         * 무릎 각도가 최소 제한보다 큰 경우
+         * 접히는 방향으로 이동
+         */
+
+        if (kneeAngle > MIN_KNEE_ANGLE)
         {
-            Serial.println("STATUS: FLEX ALLOWED");
-            driveMotor("FLEX", MOTOR_SPEED);
+            targetAngle = (int)kneeAngle - 5;
+
+            targetAngle = constrain(
+                targetAngle,
+                (int)MIN_KNEE_ANGLE,
+                (int)MAX_KNEE_ANGLE
+            );
+
+            kneeServo.write(targetAngle);
+
+            Serial.println("SERVO: FLEX");
         }
         else
         {
-            Serial.println("STATUS: FLEX BLOCKED (MIN LIMIT)");
-            driveMotor("STOP", 0);
+            stopServo();
+
+            Serial.println("SERVO: FLEX BLOCKED");
         }
     }
+
+
+    // -----------------------------------------------
+    // IDLE
+    // -----------------------------------------------
+
     else
     {
-        Serial.println("STATUS: IDLE");
-        driveMotor("STOP", 0);
+        stopServo();
+
+        Serial.println("SERVO: IDLE");
     }
 }
 
-// =========================
-// setup
-// =========================
+
+// =====================================================
+// 12. setup
+// =====================================================
+
 void setup()
 {
     Serial.begin(115200);
 
-    // 모터 제어 핀 출력 설정
-    pinMode(MOTOR_DIR_PIN, OUTPUT);
-    pinMode(MOTOR_PWM_PIN, OUTPUT);
-    
-    // 초기 모터 정지
-    driveMotor("STOP", 0);
+    delay(1000);
 
-    // EMG 센서 초기화
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("ESP32 EMG LEG ASSIST SYSTEM");
+    Serial.println("================================");
+
+
+    // ESP32 ADC 설정
+    analogReadResolution(12);
+
+
+    // -----------------------------------------------
+    // 서보 초기화
+    // -----------------------------------------------
+
+    kneeServo.setPeriodHertz(50);
+
+    kneeServo.attach(
+        SERVO_PIN,
+        500,
+        2400
+    );
+
+
+    // 초기 위치
+    kneeServo.write(90);
+
+    delay(1000);
+
+
+    // -----------------------------------------------
+    // EMG 캘리브레이션
+    // -----------------------------------------------
+
     calibrateEMG();
+
+
+    Serial.println();
+    Serial.println("================================");
+    Serial.println("SYSTEM READY");
+    Serial.println("================================");
 }
 
-// =========================
-// loop
-// =========================
+
+// =====================================================
+// 13. loop
+// =====================================================
+
 void loop()
 {
-    // 1. 현재 센서 값들 업데이트
+    // -----------------------------------------------
+    // 1. Flex 센서로 현재 각도 측정
+    // -----------------------------------------------
+
     kneeAngle = getKneeAngle();
+
+
+    // -----------------------------------------------
+    // 2. EMG로 움직임 의도 판단
+    // -----------------------------------------------
+
     detectIntent();
 
-    // 2. 의도 및 안전 제어 상태 평가 후 모터 구동
-    evaluateState();
 
-    // 3. 시리얼 모니터 데이터 출력 (디버깅용)
-    Serial.print("Quad: ");     Serial.print(quadRMS);
-    Serial.print(" | Ham: ");   Serial.print(hamRMS);
-    Serial.print(" | Thresh: "); Serial.print(activationThreshold);
-    Serial.print(" | Angle: ");  Serial.print(kneeAngle);
-    Serial.print(" | Intent: "); Serial.println(intent);
+    // -----------------------------------------------
+    // 3. 상태에 따라 서보 제어
+    // -----------------------------------------------
 
-    delay(10); // 루프 주기를 조금 더 빠르게 조절 (원래 50ms -> 10ms)
+    controlServo();
+
+
+    // -----------------------------------------------
+    // 4. Serial Monitor 출력
+    // -----------------------------------------------
+
+    Serial.println("-------------------------------");
+
+    Serial.print("Quad RMS: ");
+    Serial.println(quadRMS);
+
+    Serial.print("Ham RMS: ");
+    Serial.println(hamRMS);
+
+    Serial.print("Threshold: ");
+    Serial.println(activationThreshold);
+
+    Serial.print("Flex Angle: ");
+    Serial.println(kneeAngle);
+
+    Serial.print("Intent: ");
+    Serial.println(intent);
+
+    Serial.println("-------------------------------");
+
+
+    // 약 50ms 간격
+    delay(50);
 }
